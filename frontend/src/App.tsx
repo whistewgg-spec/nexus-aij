@@ -140,20 +140,23 @@ export default function App() {
     title = "New conversation",
   ) => {
     setError("");
+    const response = await request("/api/conversations", {
+      method: "POST",
+      body: JSON.stringify({ project_id: project, title: title.slice(0, 120) }),
+    });
+    const created: Conversation = await response.json();
+    setConversationId(created.id);
+    if (clearMessages) setMessages([]);
+    setConversations((old) => [created, ...old]);
+    setSidebarOpen(false);
+    return created.id;
+  };
+
+  const startNewConversation = async () => {
     try {
-      const response = await request("/api/conversations", {
-        method: "POST",
-        body: JSON.stringify({ project_id: project, title: title.slice(0, 120) }),
-      });
-      const created: Conversation = await response.json();
-      setConversationId(created.id);
-      if (clearMessages) setMessages([]);
-      setConversations((old) => [created, ...old]);
-      setSidebarOpen(false);
-      return created.id;
+      await createConversation();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Could not create conversation.");
-      return "";
     }
   };
 
@@ -167,11 +170,12 @@ export default function App() {
     const userMessage: Message = { id: crypto.randomUUID(), role: "user", content: text };
     const assistantId = crypto.randomUUID();
     setMessages((old) => [...old, userMessage, { id: assistantId, role: "assistant", content: "" }]);
+    let conversationCreated = false;
     try {
       let activeConversation = conversationId;
       if (!activeConversation) {
         activeConversation = await createConversation(false, text);
-        if (!activeConversation) throw new Error("Could not start a conversation.");
+        conversationCreated = true;
       }
       const response = await request(
         `/api/conversations/${activeConversation}/messages/stream`,
@@ -207,7 +211,12 @@ export default function App() {
       await Promise.all([loadConversationList(), loadCapabilities()]);
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : "The request failed.";
-      setMessages((old) => old.filter((item) => item.id !== assistantId));
+      setMessages((old) =>
+        old.filter(
+          (item) =>
+            item.id !== assistantId && (conversationCreated || item.id !== userMessage.id),
+        ),
+      );
       setError(message);
       setDraft(text);
     } finally {
@@ -232,7 +241,7 @@ export default function App() {
       {sidebarOpen && <button className="mobile-backdrop" aria-label="Close menu" onClick={() => setSidebarOpen(false)} />}
       <aside className={`sidebar ${sidebarOpen ? "sidebar-open" : ""}`}>
         <div className="brand"><div className="brand-mark"><Bot size={21} /></div><span>NEXUS<span className="brand-ai"> AI</span></span><button className="icon-button mobile-close" onClick={() => setSidebarOpen(false)} aria-label="Close menu"><X size={18} /></button></div>
-        <button className="new-chat" onClick={() => void createConversation()}><Plus size={17} /> New conversation <span>⌘ K</span></button>
+        <button className="new-chat" onClick={() => void startNewConversation()}><Plus size={17} /> New conversation <span>⌘ K</span></button>
         <form className="project-picker" onSubmit={chooseProject}>
           <label htmlFor="project-id"><FolderOpen size={15} /> Project</label>
           <div className="project-entry"><input id="project-id" value={projectDraft} onChange={(event) => setProjectDraft(event.target.value)} aria-label="Project ID" /><button aria-label="Switch project"><ChevronDown size={16} /></button></div>
