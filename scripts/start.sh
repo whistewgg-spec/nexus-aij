@@ -34,11 +34,6 @@ THREADS="$CPU_COUNT"
 if [[ "$THREADS" -gt 8 ]]; then THREADS=8; fi
 export NEXUS_CONTEXT_TOKENS="$CONTEXT_TOKENS"
 
-if curl -fsS http://127.0.0.1:8081/health >/dev/null 2>&1; then
-  echo "A llama.cpp server is already listening on port 8081." >&2
-  exit 1
-fi
-
 cleanup() {
   if [[ -n "${LLAMA_PID:-}" ]] && kill -0 "$LLAMA_PID" 2>/dev/null; then
     kill "$LLAMA_PID" 2>/dev/null || true
@@ -51,32 +46,37 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-.llama.cpp/build/bin/llama-server \
-  --model "$MODEL_PATH" \
-  --host 127.0.0.1 \
-  --port 8081 \
-  --ctx-size "$CONTEXT_TOKENS" \
-  --threads "$THREADS" \
-  --threads-batch "$THREADS" \
-  --parallel 1 &
-LLAMA_PID=$!
+LLAMA_PID=""
+if curl -fsS http://127.0.0.1:8081/health >/dev/null 2>&1; then
+  echo "Using the llama.cpp server already listening on port 8081."
+else
+  .llama.cpp/build/bin/llama-server \
+    --model "$MODEL_PATH" \
+    --host 127.0.0.1 \
+    --port 8081 \
+    --ctx-size "$CONTEXT_TOKENS" \
+    --threads "$THREADS" \
+    --threads-batch "$THREADS" \
+    --parallel 1 &
+  LLAMA_PID=$!
 
-READY=0
-for _ in $(seq 1 180); do
-  if curl -fsS http://127.0.0.1:8081/health >/dev/null 2>&1; then
-    READY=1
-    break
-  fi
-  if ! kill -0 "$LLAMA_PID" 2>/dev/null; then
-    echo "llama.cpp exited before becoming ready. Check model path, RAM, and model download." >&2
-    wait "$LLAMA_PID" || true
+  READY=0
+  for _ in $(seq 1 180); do
+    if curl -fsS http://127.0.0.1:8081/health >/dev/null 2>&1; then
+      READY=1
+      break
+    fi
+    if ! kill -0 "$LLAMA_PID" 2>/dev/null; then
+      echo "llama.cpp exited before becoming ready. Check model path, RAM, and model download." >&2
+      wait "$LLAMA_PID" || true
+      exit 1
+    fi
+    sleep 1
+  done
+  if [[ "$READY" -ne 1 ]]; then
+    echo "llama.cpp did not become ready within 180 seconds." >&2
     exit 1
   fi
-  sleep 1
-done
-if [[ "$READY" -ne 1 ]]; then
-  echo "llama.cpp did not become ready within 180 seconds." >&2
-  exit 1
 fi
 
 export NEXUS_API_TOKEN="${NEXUS_API_TOKEN:-}"
