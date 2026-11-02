@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATA_DIR = ROOT / "data"
 INFERENCE_URL = os.getenv("NEXUS_INFERENCE_URL", "http://127.0.0.1:8081")
 PROJECT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+MODEL_MAX_CONTEXT_TOKENS = 32_768
 
 
 def database_path() -> Path:
@@ -202,13 +203,22 @@ def resource_info() -> dict:
         )
 
     gib = memory_bytes / (1024**3) if memory_bytes else None
-    context_tokens = 4096 if gib and gib >= 8 else 2048 if gib and gib >= 4 else 1024
+    if gib is not None and gib >= 16:
+        context_tokens = MODEL_MAX_CONTEXT_TOKENS
+    elif gib is not None and gib >= 8:
+        context_tokens = 8192
+    elif gib is not None and gib >= 4:
+        context_tokens = 2048
+    else:
+        context_tokens = 1024
     configured_context = os.getenv("NEXUS_CONTEXT_TOKENS", "").strip()
     if configured_context:
         try:
-            context_tokens = min(max(int(configured_context), 512), 4096)
+            context_tokens = int(configured_context)
         except ValueError:
-            pass
+            raise ValueError("NEXUS_CONTEXT_TOKENS must be an integer from 512 to 32768.") from None
+        if not 512 <= context_tokens <= MODEL_MAX_CONTEXT_TOKENS:
+            raise ValueError("NEXUS_CONTEXT_TOKENS must be between 512 and 32768.")
     return {
         "cpu_count": cpu_count,
         "memory_bytes": memory_bytes,
@@ -311,7 +321,6 @@ async def inference_tokens(messages: list[dict]) -> AsyncIterator[str]:
                 "model": "local",
                 "messages": messages,
                 "stream": True,
-                "max_tokens": 512,
                 "temperature": 0.7,
             },
         ) as response:

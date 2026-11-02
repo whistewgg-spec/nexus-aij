@@ -26,8 +26,8 @@ export NEXUS_MODEL_PATH="$MODEL_PATH"
 DETECTED_RESOURCES="$(PYTHONPATH="$ROOT/backend" "$ROOT/.venv/bin/python" -c 'from app.main import resource_info; r = resource_info(); print(r["context_tokens"], r["cpu_count"])')"
 read -r DETECTED_CONTEXT CPU_COUNT <<< "$DETECTED_RESOURCES"
 CONTEXT_TOKENS="${NEXUS_CONTEXT_TOKENS:-$DETECTED_CONTEXT}"
-if [[ ! "$CONTEXT_TOKENS" =~ ^[0-9]+$ ]] || [[ "$CONTEXT_TOKENS" -lt 512 ]] || [[ "$CONTEXT_TOKENS" -gt 4096 ]]; then
-  echo "NEXUS_CONTEXT_TOKENS must be an integer from 512 to 4096." >&2
+if [[ ! "$CONTEXT_TOKENS" =~ ^[0-9]+$ ]] || [[ "$CONTEXT_TOKENS" -lt 512 ]] || [[ "$CONTEXT_TOKENS" -gt 32768 ]]; then
+  echo "NEXUS_CONTEXT_TOKENS must be an integer from 512 to 32768 (the selected model limit)." >&2
   exit 1
 fi
 THREADS="$CPU_COUNT"

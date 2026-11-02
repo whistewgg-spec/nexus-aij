@@ -33,6 +33,20 @@ def test_health_and_capabilities_report_unavailable_inference(client, monkeypatc
     assert result["resources"]["context_tokens"] > 0
 
 
+def test_context_can_be_set_to_the_model_limit(monkeypatch):
+    monkeypatch.setenv("NEXUS_CONTEXT_TOKENS", "32768")
+
+    assert main.resource_info()["context_tokens"] == 32768
+
+
+@pytest.mark.parametrize("value", ["not-a-number", "32769", "511"])
+def test_invalid_context_setting_is_reported(monkeypatch, value):
+    monkeypatch.setenv("NEXUS_CONTEXT_TOKENS", value)
+
+    with pytest.raises(ValueError, match="NEXUS_CONTEXT_TOKENS"):
+        main.resource_info()
+
+
 def test_conversations_are_isolated_by_project(client):
     alpha = client.post(
         "/api/conversations", json={"project_id": "alpha", "title": "Alpha"}
@@ -132,8 +146,10 @@ def test_unavailable_inference_returns_error_without_fake_assistant_message(
 
 @pytest.mark.anyio
 async def test_inference_client_parses_openai_compatible_sse(monkeypatch):
-    transport = httpx.MockTransport(
-        lambda request: httpx.Response(
+    requests = []
+    def handle_request(request):
+        requests.append(request)
+        return httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
             content=(
@@ -142,7 +158,8 @@ async def test_inference_client_parses_openai_compatible_sse(monkeypatch):
                 b"data: [DONE]\n\n"
             ),
         )
-    )
+
+    transport = httpx.MockTransport(handle_request)
     real_async_client = httpx.AsyncClient
     monkeypatch.setattr(
         main.httpx,
@@ -158,6 +175,8 @@ async def test_inference_client_parses_openai_compatible_sse(monkeypatch):
     ]
 
     assert tokens == ["Local ", "reply"]
+    request_payload = json.loads(requests[0].content)
+    assert "max_tokens" not in request_payload
 
 
 def test_api_token_is_enforced(client, monkeypatch):
