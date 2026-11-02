@@ -62,6 +62,28 @@ const maxTotalAttachmentBytes = 65_536;
 const maxJarAttachmentBytes = 5 * 1024 * 1024;
 const maxAttachmentsRequestBytes = maxTotalAttachmentBytes + maxJarAttachmentBytes;
 
+function formatErrorDetail(detail: unknown): string | null {
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    const messages = detail.map((item) => {
+      if (typeof item === "string") return item;
+      if (!item || typeof item !== "object") return null;
+      const issue = item as { loc?: unknown; msg?: unknown };
+      if (typeof issue.msg !== "string") return null;
+      const location = Array.isArray(issue.loc)
+        ? issue.loc.filter((part) => part !== "body").join(".")
+        : "";
+      return location ? `${location}: ${issue.msg}` : issue.msg;
+    }).filter((message): message is string => Boolean(message));
+    return messages.length ? messages.join("; ") : null;
+  }
+  if (detail && typeof detail === "object" && "msg" in detail) {
+    const message = detail.msg;
+    return typeof message === "string" ? message : null;
+  }
+  return null;
+}
+
 async function encodeAttachment(file: File) {
   if (!file.name.toLowerCase().endsWith(".jar")) {
     return { filename: file.name, content: await file.text(), encoding: "text" };
@@ -118,7 +140,9 @@ export default function App() {
       });
       if (!response.ok) {
         const detail = await response.json().catch(() => null);
-        throw new Error(detail?.detail ?? `Request failed (${response.status})`);
+        throw new Error(
+          formatErrorDetail(detail?.detail) ?? `Request failed (${response.status})`,
+        );
       }
       return response;
     },
