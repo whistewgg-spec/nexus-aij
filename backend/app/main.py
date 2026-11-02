@@ -15,7 +15,7 @@ from typing import AsyncIterator
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -456,6 +456,34 @@ async def export_project_files(
         headers={
             "Content-Disposition": f'attachment; filename="nexus-{project_id}-mod.zip"'
         },
+    )
+
+
+@app.get("/api/projects/{project_id}/files/{file_path:path}/download")
+async def download_project_file(
+    project_id: str,
+    file_path: str,
+    authorization: str | None = Header(default=None),
+):
+    require_auth(authorization)
+    relative_path = validate_project_file_path(file_path)
+    root = project_files_root(project_id)
+    candidate = root
+    for part in relative_path.parts:
+        candidate = candidate / part
+        if candidate.is_symlink():
+            raise HTTPException(status_code=404, detail="Project file not found.")
+    try:
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(root)
+    except (OSError, ValueError):
+        raise HTTPException(status_code=404, detail="Project file not found.") from None
+    if not resolved.is_file():
+        raise HTTPException(status_code=404, detail="Project file not found.")
+    return FileResponse(
+        resolved,
+        media_type="application/octet-stream",
+        filename=relative_path.name,
     )
 
 

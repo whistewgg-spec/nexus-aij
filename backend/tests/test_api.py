@@ -141,6 +141,34 @@ def test_project_export_reports_empty_projects(client):
     assert response.json()["detail"] == "This project has no files to export."
 
 
+def test_project_file_download_preserves_binary_bytes_and_extension(client, tmp_path):
+    root = main.project_files_root("demo")
+    jar_path = root / "dist" / "creature-mod.jar"
+    jar_path.parent.mkdir()
+    jar_bytes = b"PK\x03\x04binary-jar-payload\x00\xff"
+    jar_path.write_bytes(jar_bytes)
+
+    response = client.get(
+        "/api/projects/demo/files/dist/creature-mod.jar/download"
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/octet-stream"
+    assert "filename=\"creature-mod.jar\"" in response.headers["content-disposition"]
+    assert response.content == jar_bytes
+
+
+def test_project_file_download_rejects_traversal_and_missing_files(client):
+    assert (
+        client.get("/api/projects/demo/files/../secret.jar/download").status_code
+        == 404
+    )
+    assert (
+        client.get("/api/projects/demo/files/missing.jar/download").status_code
+        == 404
+    )
+
+
 def test_message_stream_persists_user_and_assistant_messages(client, monkeypatch):
     conversation = client.post(
         "/api/conversations", json={"project_id": "demo"}

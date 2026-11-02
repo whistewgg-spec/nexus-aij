@@ -75,6 +75,7 @@ export default function App() {
   const [fileProposal, setFileProposal] = useState<FileProposal | null>(null);
   const [savingFile, setSavingFile] = useState(false);
   const [exportingProject, setExportingProject] = useState(false);
+  const [downloadingFile, setDownloadingFile] = useState("");
   const [capabilities, setCapabilities] = useState<Capabilities | null>(null);
   const [draft, setDraft] = useState("");
   const [loading, setLoading] = useState(false);
@@ -388,6 +389,33 @@ export default function App() {
     }
   };
 
+  const downloadProjectFile = async (path: string) => {
+    if (downloadingFile) return;
+    try {
+      setDownloadingFile(path);
+      setError("");
+      const response = await request(
+        `/api/projects/${encodeURIComponent(project)}/files/${path
+          .split("/")
+          .map(encodeURIComponent)
+          .join("/")}/download`,
+      );
+      const file = await response.blob();
+      const url = URL.createObjectURL(file);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = path.split("/").pop() ?? "download";
+      document.body.append(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : `Could not download ${path}.`);
+    } finally {
+      setDownloadingFile("");
+    }
+  };
+
   const chooseProject = (event: FormEvent) => {
     event.preventDefault();
     const next = projectDraft.trim();
@@ -434,6 +462,16 @@ export default function App() {
             <div className="project-file" key={file.path} title={`${file.path} · ${file.size_bytes} bytes`}>
               <FilePlus2 size={13} />
               <span>{file.path}</span>
+              <button
+                type="button"
+                className="download-project-file"
+                onClick={() => void downloadProjectFile(file.path)}
+                disabled={Boolean(downloadingFile)}
+                title={`Download ${file.path} in its original format`}
+                aria-label={`Download ${file.path}`}
+              >
+                <Download size={13} />
+              </button>
             </div>
           ))}
           {!projectFiles.length && <div className="empty-history">Files you approve will appear here.</div>}
