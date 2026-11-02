@@ -4,7 +4,7 @@ NEXUS runs inference on the CPU in your Codespace with llama.cpp. The web app an
 
 ## Start in GitHub Codespaces
 
-1. Create a Codespace for this repository. The dev container forwards the web app on **5173** and API on **8000**, both private by default.
+1. Create a Codespace for this repository. The dev container forwards the web app on **5173** and API on **8000**, both private by default. The Vite web server proxies `/api` requests to the local FastAPI server, so the browser only needs the web-app port.
 2. The dev container runs `bash scripts/setup.sh` automatically after creation. If setup did not run, start it from the Codespace terminal. It installs Python and frontend dependencies and builds llama.cpp for CPU. It requires network access, a C++ compiler, CMake, Node.js, Python 3, and Git.
 3. Optionally configure a bearer token before exposing anything beyond private forwarded ports:
 

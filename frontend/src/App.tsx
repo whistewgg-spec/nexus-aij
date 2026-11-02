@@ -38,8 +38,7 @@ type Capabilities = {
 function apiBase() {
   const configured = import.meta.env.VITE_API_BASE_URL as string | undefined;
   if (configured) return configured.replace(/\/$/, "");
-  const host = window.location.hostname.replace(/-5173(?=\.app\.github\.dev$)/, "-8000");
-  return `${window.location.protocol}//${host}:8000`;
+  return "";
 }
 
 const BASE = apiBase();
@@ -139,7 +138,7 @@ export default function App() {
         if (active) setAuthRequired(status.required);
       })
       .catch(() => {
-        if (active) setError(`Cannot reach the NEXUS API at ${BASE}. Start the API and refresh.`);
+        if (active) setError("Cannot reach the NEXUS API. Confirm scripts/start.sh is running, then refresh.");
       });
     void loadCapabilities();
     return () => {
@@ -339,12 +338,12 @@ export default function App() {
           {!projectFiles.length && <div className="empty-history">Files you approve will appear here.</div>}
         </div>
         <div className="sidebar-bottom">
-          <div className="local-badge"><span className={`status-dot ${capabilities?.inference_available ? "online" : ""}`} /><span>{capabilities?.inference_available ? "Local model online" : "Model not running"}</span></div>
+          <div className="local-badge"><span className={`status-dot ${capabilities?.inference_available ? "online" : ""}`} /><span>{!capabilities ? "API unavailable" : capabilities.inference_available ? "Local model online" : "Model not running"}</span></div>
           <div className="sidebar-foot">Private by design <Shield size={13} /></div>
         </div>
       </aside>
       <section className="main-panel">
-        <header className="topbar"><div className="topbar-left"><button className="icon-button mobile-menu" onClick={() => setSidebarOpen(true)} aria-label="Open menu"><Menu size={19} /></button><div className="crumb">Workspace <span>/</span> <b>{project}</b></div></div><div className="system-status"><span className={`status-dot ${capabilities?.inference_available ? "online" : ""}`} />{capabilities?.inference_available ? "Inference ready" : "Waiting for model"}</div></header>
+        <header className="topbar"><div className="topbar-left"><button className="icon-button mobile-menu" onClick={() => setSidebarOpen(true)} aria-label="Open menu"><Menu size={19} /></button><div className="crumb">Workspace <span>/</span> <b>{project}</b></div></div><div className="system-status"><span className={`status-dot ${capabilities?.inference_available ? "online" : ""}`} />{!capabilities ? "API unavailable" : capabilities.inference_available ? "Inference ready" : "Waiting for model"}</div></header>
         <div className={`content ${messages.length ? "chat-content" : ""}`}>
           {messages.length === 0 && !fileProposal ? <div className="welcome">
             <div className="welcome-orbit"><div className="welcome-logo"><Bot size={29} /></div><span className="orbit-dot orbit-one" /><span className="orbit-dot orbit-two" /></div>
@@ -352,7 +351,7 @@ export default function App() {
             <h1>Think clearly.<br /><span>Build anything.</span></h1>
             <p className="welcome-description">A capable AI, running close to your work.<br />Your conversations stay in this workspace.</p>
             <div className="suggestions"><button onClick={() => setDraft("Explain how this project works.")}> <span>01</span> Explain how this project works <span>↗</span></button><button onClick={() => setDraft("Help me think through an idea.")}><span>02</span> Help me think through an idea <span>↗</span></button><button onClick={() => setDraft("Write a Python script that...")}><span>03</span> Write a Python script that... <span>↗</span></button></div>
-            <div className="capability-card"><div className="capability-icon"><Cpu size={17} /></div><div className="capability-copy"><b>{capabilities?.model_path ?? "Qwen 2.5 · 0.5B"}</b><span>{capabilities?.inference_available ? "Running locally via llama.cpp" : capabilities?.model_available ? "Model downloaded · server stopped" : "Waiting for setup · CPU inference"}</span></div><div className="capability-resource"><Activity size={14} /><span>{capabilities ? `${capabilities.resources.cpu_count} CPU · ${capabilities.resources.context_tokens} ctx` : "Detecting resources"}</span></div></div>
+            <div className="capability-card"><div className="capability-icon"><Cpu size={17} /></div><div className="capability-copy"><b>{capabilities?.model_path ?? "API unavailable"}</b><span>{!capabilities ? "Cannot connect to the NEXUS API" : capabilities.inference_available ? "Running locally via llama.cpp" : capabilities.model_available ? "Model downloaded · server stopped" : "Waiting for setup · CPU inference"}</span></div><div className="capability-resource"><Activity size={14} /><span>{capabilities ? `${capabilities.resources.cpu_count} CPU · ${capabilities.resources.context_tokens} ctx` : "Resources unavailable"}</span></div></div>
           </div> : (
             <div className="messages">
               {messages.map((message) => (
@@ -460,9 +459,11 @@ export default function App() {
             <div className="composer-tools">
               <span>
                 <span className="composer-dot" />{" "}
-                {capabilities?.inference_available
-                  ? "Local inference ready"
-                  : "Inference offline"}
+                {!capabilities
+                  ? "API offline"
+                  : capabilities.inference_available
+                    ? "Local inference ready"
+                    : "Inference offline"}
               </span>
               <button
                 type="button"
