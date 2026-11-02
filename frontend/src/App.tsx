@@ -59,6 +59,24 @@ const attachmentExtensions = new Set([
 ]);
 const maxAttachmentBytes = 32_768;
 const maxTotalAttachmentBytes = 65_536;
+const maxJarAttachmentBytes = 5 * 1024 * 1024;
+const maxAttachmentsRequestBytes = maxTotalAttachmentBytes + maxJarAttachmentBytes;
+
+async function encodeAttachment(file: File) {
+  if (!file.name.toLowerCase().endsWith(".jar")) {
+    return { filename: file.name, content: await file.text(), encoding: "text" };
+  }
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+  }
+  return {
+    filename: file.name,
+    content: btoa(binary),
+    encoding: "base64",
+  };
+}
 
 export default function App() {
   const [project, setProject] = useState("default");
@@ -239,9 +257,7 @@ export default function App() {
         );
         conversationCreated = true;
       }
-      const requestAttachments = await Promise.all(
-        pendingFiles.map(async (file) => ({ filename: file.name, content: await file.text() })),
-      );
+      const requestAttachments = await Promise.all(pendingFiles.map(encodeAttachment));
       const response = await request(
         `/api/conversations/${activeConversation}/messages/stream`,
         {
@@ -319,22 +335,34 @@ export default function App() {
     const selected = Array.from(files);
     const currentBytes = attachments.reduce((total, file) => total + file.size, 0);
     const incomingBytes = selected.reduce((total, file) => total + file.size, 0);
+    const hasJar = attachments.some((file) => file.name.toLowerCase().endsWith(".jar"));
     const invalid = selected.find((file) => {
       const extension = file.name.slice(file.name.lastIndexOf(".")).toLowerCase();
+      const isJar = extension === ".jar";
       return (
-        file.name.startsWith(".env") ||
+        file.name.toLowerCase().startsWith(".env") ||
         /\.(pem|key|p12|pfx|secret|credentials)$/i.test(file.name) ||
-        !attachmentExtensions.has(extension)
+        (!isJar && !attachmentExtensions.has(extension))
       );
     });
     if (invalid) {
-      setError(`${invalid.name} is not a supported text/code file. Secret and binary files are not allowed.`);
+      setError(`${invalid.name} is not a supported text/code file or JAR. Secret files are not allowed.`);
     } else if (attachments.length + selected.length > 3) {
       setError("Attach up to 3 files per message.");
-    } else if (currentBytes + incomingBytes > maxTotalAttachmentBytes) {
-      setError("Attachments together must be no larger than 64 KiB.");
-    } else if (selected.some((file) => file.size > maxAttachmentBytes)) {
-      setError("Each attachment must be no larger than 32 KiB.");
+    } else if (
+      (hasJar || selected.filter((file) => file.name.toLowerCase().endsWith(".jar")).length > 1)
+    ) {
+      setError("Attach only one JAR per message.");
+    } else if (
+      selected.some((file) =>
+        file.name.toLowerCase().endsWith(".jar")
+          ? file.size > maxJarAttachmentBytes
+          : file.size > maxAttachmentBytes,
+      )
+    ) {
+      setError("Each text file is limited to 32 KiB and each JAR to 5 MiB.");
+    } else if (currentBytes + incomingBytes > maxAttachmentsRequestBytes) {
+      setError("Attachments may include one JAR up to 5 MiB and text files totaling 64 KiB.");
     } else {
       setAttachments((current) => [...current, ...selected]);
       setError("");
@@ -608,7 +636,7 @@ export default function App() {
               className="attachment-input"
               type="file"
               multiple
-              accept={[...attachmentExtensions].join(",")}
+              accept={[...attachmentExtensions, ".jar"].join(",")}
               onChange={(event) => addAttachments(event.target.files)}
               aria-label="Choose text or code files to attach"
             />
@@ -661,7 +689,7 @@ export default function App() {
                 onClick={() => attachmentInputRef.current?.click()}
                 disabled={loading || attachments.length >= 3}
                 aria-label="Attach text or code files"
-                title="Attach text/code files (up to 3, 64 KiB total)"
+                title="Attach text/code files or one JAR (up to 5 MiB)"
               >
                 <Paperclip size={16} />
               </button>

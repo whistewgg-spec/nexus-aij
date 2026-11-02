@@ -1,5 +1,6 @@
 import json
 import zipfile
+import base64
 from io import BytesIO
 
 import httpx
@@ -345,6 +346,119 @@ def test_message_can_be_sent_with_only_a_text_attachment(client, monkeypatch):
     )
 
     assert response.status_code == 200
+
+
+def test_jar_attachment_exposes_manifest_and_text_resources_to_local_model(client, monkeypatch):
+    conversation = client.post(
+        "/api/conversations", json={"project_id": "demo"}
+    ).json()
+    archive_bytes = BytesIO()
+    with zipfile.ZipFile(archive_bytes, "w") as archive:
+        archive.writestr(
+            "META-INF/MANIFEST.MF",
+            "Manifest-Version: 1.0\nImplementation-Title: Nightfall Bloodlines\n",
+        )
+        archive.writestr("fabric.mod.json", '{"id":"nightfall_bloodlines"}')
+        archive.writestr("com/example/Creature.class", b"\xca\xfe\xba\xbe")
+    jar_data = archive_bytes.getvalue()
+    captured_messages = []
+
+    async def available():
+        return True
+
+    async def events(messages, file_path=None):
+        captured_messages.extend(messages)
+        yield {"type": "token", "token": "This JAR contains a Fabric mod."}
+
+    monkeypatch.setattr(main, "inference_health", available)
+    monkeypatch.setattr(main, "inference_events", events)
+    response = client.post(
+        f"/api/conversations/{conversation['id']}/messages/stream",
+        json={
+            "project_id": "demo",
+            "content": "What mod is this?",
+            "attachments": [
+                {
+                    "filename": "nightfall_bloodlines-1.0.0-final.jar",
+                    "encoding": "base64",
+                    "content": base64.b64encode(jar_data).decode("ascii"),
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    prompt = "\n".join(message["content"] for message in captured_messages)
+    assert "nightfall_bloodlines" in prompt
+    assert "Implementation-Title: Nightfall Bloodlines" in prompt
+    assert "com/example/Creature.class" in prompt
+    assert "not executed or decompiled" in prompt
+    history = client.get(
+        f"/api/conversations/{conversation['id']}/messages",
+        params={"project_id": "demo"},
+    ).json()
+    assert history[0]["attachments"] == [
+        {
+            "filename": "nightfall_bloodlines-1.0.0-final.jar",
+            "size_bytes": len(jar_data),
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "filename, content",
+    [
+        ("bad.jar", "not-base64"),
+        ("bad.jar", base64.b64encode(b"not a zip").decode("ascii")),
+    ],
+)
+def test_jar_attachment_rejects_invalid_archive_content(client, filename, content):
+    conversation = client.post(
+        "/api/conversations", json={"project_id": "demo"}
+    ).json()
+
+    response = client.post(
+        f"/api/conversations/{conversation['id']}/messages/stream",
+        json={
+            "project_id": "demo",
+            "content": "Inspect this",
+            "attachments": [
+                {"filename": filename, "encoding": "base64", "content": content}
+            ],
+        },
+    )
+
+    assert response.status_code == 422
+    assert client.get(
+        f"/api/conversations/{conversation['id']}/messages",
+        params={"project_id": "demo"},
+    ).json() == []
+
+
+def test_jar_attachment_rejects_unsafe_archive_paths(client):
+    conversation = client.post(
+        "/api/conversations", json={"project_id": "demo"}
+    ).json()
+    archive_bytes = BytesIO()
+    with zipfile.ZipFile(archive_bytes, "w") as archive:
+        archive.writestr("../outside.txt", "unsafe")
+
+    response = client.post(
+        f"/api/conversations/{conversation['id']}/messages/stream",
+        json={
+            "project_id": "demo",
+            "content": "Inspect this",
+            "attachments": [
+                {
+                    "filename": "unsafe.jar",
+                    "encoding": "base64",
+                    "content": base64.b64encode(archive_bytes.getvalue()).decode("ascii"),
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 422
 
 
 def test_unavailable_inference_returns_error_without_fake_assistant_message(

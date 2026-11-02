@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import binascii
 import hmac
 import io
 import json
@@ -7,6 +9,7 @@ import re
 import sqlite3
 import uuid
 import zipfile
+import zlib
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -31,6 +34,10 @@ ALLOWED_ATTACHMENT_EXTENSIONS = {
 }
 MAX_ATTACHMENT_BYTES = 32_768
 MAX_TOTAL_ATTACHMENT_BYTES = 65_536
+MAX_JAR_ATTACHMENT_BYTES = 5 * 1024 * 1024
+MAX_JAR_ENTRIES = 3_000
+MAX_JAR_TEXT_BYTES = 96 * 1024
+MAX_JAR_TEXT_FILE_BYTES = 24 * 1024
 MAX_PROJECT_EXPORT_BYTES = 64 * 1024 * 1024
 MAX_PROJECT_EXPORT_FILES = 1000
 
@@ -106,7 +113,8 @@ class ConversationCreate(BaseModel):
 
 class MessageAttachment(BaseModel):
     filename: str = Field(min_length=1, max_length=128)
-    content: str = Field(max_length=MAX_ATTACHMENT_BYTES)
+    content: str = Field(max_length=7_000_000)
+    encoding: str = Field(default="text", pattern="^(text|base64)$")
 
     @field_validator("filename")
     @classmethod
@@ -118,7 +126,13 @@ class MessageAttachment(BaseModel):
             or any(ord(character) < 32 for character in filename)
             or filename in {".", ".."}
             or filename.lower().startswith(".env")
-            or Path(filename).suffix.lower() not in ALLOWED_ATTACHMENT_EXTENSIONS
+            or (
+                Path(filename).suffix.lower() not in ALLOWED_ATTACHMENT_EXTENSIONS
+                and not (
+                    Path(filename).suffix.lower() == ".jar"
+                    and filename.lower().endswith(".jar")
+                )
+            )
             or re.search(r"\.(pem|key|p12|pfx|secret|credentials)$", filename, re.I)
         ):
             raise ValueError("Attach a supported text or code file, not a path or secret file.")
@@ -127,9 +141,20 @@ class MessageAttachment(BaseModel):
     @field_validator("content")
     @classmethod
     def validate_content(cls, content: str) -> str:
-        if "\x00" in content or len(content.encode("utf-8")) > MAX_ATTACHMENT_BYTES:
-            raise ValueError("Each text attachment must be no larger than 32 KiB.")
+        if "\x00" in content:
+            raise ValueError("Attachments cannot contain binary null bytes.")
         return content
+
+    @model_validator(mode="after")
+    def validate_encoding(self):
+        is_jar = self.filename.lower().endswith(".jar")
+        if is_jar != (self.encoding == "base64"):
+            raise ValueError("JAR files must be attached as binary; other attachments must be text.")
+        if not is_jar and len(self.content.encode("utf-8")) > MAX_ATTACHMENT_BYTES:
+            raise ValueError("Each text attachment must be no larger than 32 KiB.")
+        if is_jar and len(self.content) > ((MAX_JAR_ATTACHMENT_BYTES + 2) // 3) * 4:
+            raise ValueError("JAR attachments must be no larger than 5 MiB.")
+        return self
 
 
 class MessageCreate(BaseModel):
@@ -143,10 +168,128 @@ class MessageCreate(BaseModel):
     def validate_request_content(self):
         if not self.content.strip() and not self.attachments:
             raise ValueError("Write a message or attach a text file.")
-        total_bytes = sum(len(item.content.encode("utf-8")) for item in self.attachments)
-        if total_bytes > MAX_TOTAL_ATTACHMENT_BYTES:
-            raise ValueError("Attachments together must be no larger than 64 KiB.")
+        jar_count = sum(item.encoding == "base64" for item in self.attachments)
+        if jar_count > 1:
+            raise ValueError("Attach only one JAR per message.")
+        text_bytes = sum(
+            len(item.content.encode("utf-8"))
+            for item in self.attachments
+            if item.encoding == "text"
+        )
+        if text_bytes > MAX_TOTAL_ATTACHMENT_BYTES:
+            raise ValueError("Text attachments together must be no larger than 64 KiB.")
+        total_bytes = sum(
+            (
+                (len(item.content) * 3) // 4
+                if item.encoding == "base64"
+                else len(item.content.encode("utf-8"))
+            )
+            for item in self.attachments
+        )
+        total_limit = MAX_JAR_ATTACHMENT_BYTES + MAX_TOTAL_ATTACHMENT_BYTES
+        if total_bytes > total_limit:
+            raise ValueError(
+                "Attach one JAR up to 5 MiB plus text files totaling no more than 64 KiB."
+            )
         return self
+
+
+def prepare_message_attachment(attachment: MessageAttachment) -> dict:
+    if attachment.encoding == "text":
+        return {
+            "filename": attachment.filename,
+            "content": attachment.content,
+            "size_bytes": len(attachment.content.encode("utf-8")),
+        }
+
+    try:
+        archive_bytes = base64.b64decode(attachment.content, validate=True)
+    except (binascii.Error, ValueError):
+        raise HTTPException(status_code=422, detail="The JAR attachment is not valid base64.") from None
+    if len(archive_bytes) > MAX_JAR_ATTACHMENT_BYTES:
+        raise HTTPException(status_code=413, detail="JAR attachments are limited to 5 MiB.")
+    try:
+        with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+            entries = archive.infolist()
+            if len(entries) > MAX_JAR_ENTRIES:
+                raise HTTPException(status_code=413, detail="JAR contains too many entries.")
+            if sum(entry.file_size for entry in entries) > 1024 * 1024 * 1024:
+                raise HTTPException(status_code=413, detail="JAR expands beyond the 1 GiB inspection limit.")
+
+            paths = []
+            text_parts = []
+            extracted_bytes = 0
+            for entry in entries:
+                if entry.is_dir():
+                    continue
+                entry_path = PurePosixPath(entry.filename)
+                if (
+                    entry_path.is_absolute()
+                    or "\\" in entry.filename
+                    or any(part in {"", ".", ".."} for part in entry_path.parts)
+                ):
+                    raise HTTPException(
+                        status_code=422,
+                        detail="JAR contains an unsafe archive path.",
+                    )
+                if entry.external_attr >> 16 & 0o170000 == 0o120000:
+                    continue
+                paths.append(entry.filename)
+                extension = Path(entry.filename).suffix.lower()
+                is_metadata = entry.filename.lower() in {
+                    "meta-inf/manifest.mf",
+                    "meta-inf/mods.toml",
+                    "meta-inf/neoforge.mods.toml",
+                    "fabric.mod.json",
+                    "mcmod.info",
+                }
+                if (
+                    (is_metadata or extension in ALLOWED_ATTACHMENT_EXTENSIONS)
+                    and entry.file_size <= MAX_JAR_TEXT_FILE_BYTES
+                    and extracted_bytes + entry.file_size <= MAX_JAR_TEXT_BYTES
+                ):
+                    try:
+                        text = archive.read(entry).decode("utf-8")
+                    except (
+                        UnicodeDecodeError,
+                        RuntimeError,
+                        NotImplementedError,
+                        EOFError,
+                        zipfile.BadZipFile,
+                        zlib.error,
+                    ):
+                        continue
+                    text_parts.append(f"--- {entry.filename} ---\n{text}")
+                    extracted_bytes += entry.file_size
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=422, detail="The JAR attachment is not a valid ZIP/JAR archive.") from None
+
+    listing_entries = []
+    listing_size = 0
+    for path in paths:
+        if listing_size + len(path) + 1 > 16 * 1024:
+            break
+        listing_entries.append(path)
+        listing_size += len(path) + 1
+    listing = "\n".join(listing_entries)
+    if len(paths) > len(listing_entries):
+        listing += f"\n... and {len(paths) - len(listing_entries)} more entries"
+    summary = (
+        f"JAR archive: {attachment.filename}\n"
+        f"Archive entries: {len(paths)}\n"
+        "Class files are listed but not executed or decompiled.\n"
+        "Entry paths:\n"
+        f"{listing or '(no files)'}"
+    )
+    if text_parts:
+        summary += "\n\nReadable text and mod metadata:\n" + "\n\n".join(text_parts)
+    else:
+        summary += "\n\nNo readable text metadata was found."
+    return {
+        "filename": attachment.filename,
+        "content": summary,
+        "size_bytes": len(archive_bytes),
+    }
 
 
 class ProjectFileCreate(BaseModel):
@@ -694,6 +837,9 @@ async def stream_message(
                 detail="Choose a relative file path before asking NEXUS to create a file.",
             )
         validate_project_file_path(body.file_path)
+    prepared_attachments = [
+        prepare_message_attachment(attachment) for attachment in body.attachments
+    ]
     message_id = str(uuid.uuid4())
     with connect_db() as db:
         conversation = db.execute(
@@ -712,11 +858,11 @@ async def stream_message(
             [
                 (
                     message_id,
-                    attachment.filename,
-                    attachment.content,
-                    len(attachment.content.encode("utf-8")),
+                    attachment["filename"],
+                    attachment["content"],
+                    attachment["size_bytes"],
                 )
-                for attachment in body.attachments
+                for attachment in prepared_attachments
             ],
         )
         db.execute(
