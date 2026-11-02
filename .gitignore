@@ -1,0 +1,10 @@
+.env
+.venv/
+node_modules/
+dist/
+data/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+.llama.cpp/
+*.tsbuildinfo
