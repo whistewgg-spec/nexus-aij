@@ -405,6 +405,24 @@ def test_jar_attachment_exposes_manifest_and_text_resources_to_local_model(clien
     ]
 
 
+def test_jar_attachment_context_is_bounded_for_small_local_models():
+    archive_bytes = BytesIO()
+    with zipfile.ZipFile(archive_bytes, "w") as archive:
+        archive.writestr("fabric.mod.json", '{"id":"nightfall"}')
+        archive.writestr("assets/mod/readme.txt", "mod details " * 300)
+
+    attachment = main.MessageAttachment(
+        filename="large-metadata.jar",
+        encoding="base64",
+        content=base64.b64encode(archive_bytes.getvalue()).decode("ascii"),
+    )
+    prepared = main.prepare_message_attachment(attachment)
+
+    assert len(prepared["content"]) <= main.MAX_JAR_CONTEXT_CHARS
+    assert "nightfall" in prepared["content"]
+    assert "[Archive summary truncated" in prepared["content"]
+
+
 @pytest.mark.parametrize(
     "filename, content",
     [
@@ -693,6 +711,28 @@ async def test_inference_client_parses_openai_compatible_sse(monkeypatch):
     ]
     request_payload = json.loads(requests[0].content)
     assert "max_tokens" not in request_payload
+
+
+@pytest.mark.anyio
+async def test_inference_client_reports_local_model_rejection_details(monkeypatch):
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            400,
+            json={"error": {"message": "prompt is too long"}},
+        )
+    )
+    real_async_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        main.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_async_client(transport=transport, **kwargs),
+    )
+
+    with pytest.raises(RuntimeError, match="prompt is too long"):
+        async for _ in main.inference_events(
+            [{"role": "user", "content": "Inspect this JAR"}]
+        ):
+            pass
 
 
 def test_api_token_is_enforced(client, monkeypatch):

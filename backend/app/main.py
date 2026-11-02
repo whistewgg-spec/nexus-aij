@@ -36,8 +36,10 @@ MAX_ATTACHMENT_BYTES = 32_768
 MAX_TOTAL_ATTACHMENT_BYTES = 65_536
 MAX_JAR_ATTACHMENT_BYTES = 5 * 1024 * 1024
 MAX_JAR_ENTRIES = 3_000
-MAX_JAR_TEXT_BYTES = 96 * 1024
+MAX_JAR_TEXT_BYTES = 4 * 1024
 MAX_JAR_TEXT_FILE_BYTES = 24 * 1024
+MAX_JAR_CONTEXT_CHARS = 3_000
+MAX_JAR_LISTING_CHARS = 1_000
 MAX_PROJECT_EXPORT_BYTES = 64 * 1024 * 1024
 MAX_PROJECT_EXPORT_FILES = 1000
 
@@ -267,7 +269,7 @@ def prepare_message_attachment(attachment: MessageAttachment) -> dict:
     listing_entries = []
     listing_size = 0
     for path in paths:
-        if listing_size + len(path) + 1 > 16 * 1024:
+        if listing_size + len(path) + 1 > MAX_JAR_LISTING_CHARS:
             break
         listing_entries.append(path)
         listing_size += len(path) + 1
@@ -285,6 +287,9 @@ def prepare_message_attachment(attachment: MessageAttachment) -> dict:
         summary += "\n\nReadable text and mod metadata:\n" + "\n\n".join(text_parts)
     else:
         summary += "\n\nNo readable text metadata was found."
+    if len(summary) > MAX_JAR_CONTEXT_CHARS:
+        marker = "\n\n[Archive summary truncated to fit the local model context.]"
+        summary = summary[: MAX_JAR_CONTEXT_CHARS - len(marker)] + marker
     return {
         "filename": attachment.filename,
         "content": summary,
@@ -774,6 +779,21 @@ async def inference_events(
             f"{INFERENCE_URL}/v1/chat/completions",
             json=payload,
         ) as response:
+            if response.is_error:
+                body = await response.aread()
+                try:
+                    error_data = json.loads(body)
+                    error = error_data.get("error", error_data)
+                    if isinstance(error, dict):
+                        detail = error.get("message") or error.get("type")
+                    else:
+                        detail = str(error)
+                except (json.JSONDecodeError, AttributeError):
+                    detail = body.decode("utf-8", errors="replace").strip()
+                detail = str(detail or response.reason_phrase)[:500]
+                raise RuntimeError(
+                    f"Local model rejected the request ({response.status_code}): {detail}"
+                )
             response.raise_for_status()
             async for line in response.aiter_lines():
                 if not line.startswith("data:"):
