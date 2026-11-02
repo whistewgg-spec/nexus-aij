@@ -4,6 +4,7 @@ import {
   Bot,
   ChevronDown,
   Cpu,
+  Download,
   FilePlus2,
   FolderOpen,
   Menu,
@@ -73,6 +74,7 @@ export default function App() {
   const [filePath, setFilePath] = useState("");
   const [fileProposal, setFileProposal] = useState<FileProposal | null>(null);
   const [savingFile, setSavingFile] = useState(false);
+  const [exportingProject, setExportingProject] = useState(false);
   const [capabilities, setCapabilities] = useState<Capabilities | null>(null);
   const [draft, setDraft] = useState("");
   const [loading, setLoading] = useState(false);
@@ -362,6 +364,30 @@ export default function App() {
     }
   };
 
+  const exportProject = async () => {
+    if (exportingProject || projectFiles.length === 0) return;
+    try {
+      setExportingProject(true);
+      setError("");
+      const response = await request(
+        `/api/projects/${encodeURIComponent(project)}/export`,
+      );
+      const archive = await response.blob();
+      const url = URL.createObjectURL(archive);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `nexus-${project}-mod.zip`;
+      document.body.append(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not export project files.");
+    } finally {
+      setExportingProject(false);
+    }
+  };
+
   const chooseProject = (event: FormEvent) => {
     event.preventDefault();
     const next = projectDraft.trim();
@@ -389,7 +415,20 @@ export default function App() {
           {conversations.map((conversation) => <button key={conversation.id} className={`history-item ${conversation.id === conversationId ? "history-active" : ""}`} onClick={() => { setConversationId(conversation.id); setSidebarOpen(false); void loadMessages(conversation.id); }}><MessageSquare size={15} /><span>{conversation.title}</span></button>)}
           {!conversations.length && <div className="empty-history">Your conversations will appear here.</div>}
         </div>
-        <div className="history-title">PROJECT FILES</div>
+        <div className="files-heading">
+          <div className="history-title">PROJECT FILES</div>
+          <button
+            type="button"
+            className="export-project"
+            onClick={() => void exportProject()}
+            disabled={!projectFiles.length || exportingProject}
+            title="Download project files as a ZIP mod"
+            aria-label="Export project files as ZIP"
+          >
+            <Download size={13} />
+            {exportingProject ? "Preparing…" : "Export ZIP"}
+          </button>
+        </div>
         <div className="project-files">
           {projectFiles.map((file) => (
             <div className="project-file" key={file.path} title={`${file.path} · ${file.size_bytes} bytes`}>

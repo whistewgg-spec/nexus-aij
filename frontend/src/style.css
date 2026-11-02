@@ -126,6 +126,24 @@ button { color: inherit; }
   font-weight: 500;
 }
 
+.files-heading { display: flex; align-items: center; justify-content: space-between; margin-right: 4px; }
+.files-heading .history-title { margin-bottom: 8px; }
+.export-project {
+  display: inline-flex;
+  min-height: 25px;
+  align-items: center;
+  gap: 5px;
+  padding: 0 7px;
+  border: 1px solid #383838;
+  border-radius: 6px;
+  background: #222;
+  color: #c9c9c9;
+  cursor: pointer;
+  font-size: 9px;
+}
+.export-project:hover:not(:disabled) { border-color: #606060; background: #303030; color: #fff; }
+.export-project:disabled { cursor: not-allowed; opacity: .45; }
+
 .conversation-list { min-height: 30px; overflow-y: auto; }
 .history-item {
   display: flex;

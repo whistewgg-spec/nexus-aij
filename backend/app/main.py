@@ -1,17 +1,19 @@
 import asyncio
 import hmac
+import io
 import json
 import os
 import re
 import sqlite3
 import uuid
+import zipfile
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import AsyncIterator
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -29,6 +31,8 @@ ALLOWED_ATTACHMENT_EXTENSIONS = {
 }
 MAX_ATTACHMENT_BYTES = 32_768
 MAX_TOTAL_ATTACHMENT_BYTES = 65_536
+MAX_PROJECT_EXPORT_BYTES = 64 * 1024 * 1024
+MAX_PROJECT_EXPORT_FILES = 1000
 
 
 def database_path() -> Path:
@@ -403,6 +407,56 @@ async def list_project_files(
                 }
             )
     return sorted(files, key=lambda item: item["path"])
+
+
+@app.get("/api/projects/{project_id}/export")
+async def export_project_files(
+    project_id: str,
+    authorization: str | None = Header(default=None),
+):
+    require_auth(authorization)
+    root = project_files_root(project_id)
+    candidates = []
+    total_size = 0
+    for candidate in root.rglob("*"):
+        if candidate.is_symlink() or not candidate.is_file():
+            continue
+        resolved = candidate.resolve()
+        if not resolved.is_relative_to(root):
+            continue
+        info = candidate.stat()
+        total_size += info.st_size
+        if total_size > MAX_PROJECT_EXPORT_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail="Project export is limited to 64 MiB.",
+            )
+        candidates.append((candidate, info.st_size))
+        if len(candidates) > MAX_PROJECT_EXPORT_FILES:
+            raise HTTPException(
+                status_code=413,
+                detail="Project export is limited to 1000 files.",
+            )
+    if not candidates:
+        raise HTTPException(status_code=404, detail="This project has no files to export.")
+
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, mode="w", compression=zipfile.ZIP_DEFLATED) as output:
+        for candidate, expected_size in candidates:
+            content = candidate.read_bytes()
+            if len(content) != expected_size:
+                raise HTTPException(
+                    status_code=409,
+                    detail="A project file changed while the export was being prepared.",
+                )
+            output.writestr(candidate.relative_to(root).as_posix(), content)
+    return Response(
+        content=archive.getvalue(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="nexus-{project_id}-mod.zip"'
+        },
+    )
 
 
 @app.post("/api/projects/{project_id}/files", status_code=201)

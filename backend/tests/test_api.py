@@ -1,4 +1,6 @@
 import json
+import zipfile
+from io import BytesIO
 
 import httpx
 import pytest
@@ -108,6 +110,35 @@ def test_project_files_are_separated_by_project(client):
     )
 
     assert client.get("/api/projects/beta/files").json() == []
+
+
+def test_project_export_downloads_only_active_project_files(client):
+    client.post(
+        "/api/projects/demo/files",
+        json={"path": "src/main.py", "content": "print('mod')\n"},
+    )
+    client.post(
+        "/api/projects/other/files",
+        json={"path": "secret.txt", "content": "not part of this project"},
+    )
+
+    response = client.get("/api/projects/demo/export")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/zip"
+    assert response.headers["content-disposition"] == (
+        'attachment; filename="nexus-demo-mod.zip"'
+    )
+    with zipfile.ZipFile(BytesIO(response.content)) as archive:
+        assert archive.namelist() == ["src/main.py"]
+        assert archive.read("src/main.py") == b"print('mod')\n"
+
+
+def test_project_export_reports_empty_projects(client):
+    response = client.get("/api/projects/empty/export")
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "This project has no files to export."
 
 
 def test_message_stream_persists_user_and_assistant_messages(client, monkeypatch):
