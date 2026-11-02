@@ -8,6 +8,7 @@ import {
   FolderOpen,
   Menu,
   MessageSquare,
+  Paperclip,
   Plus,
   Send,
   Shield,
@@ -20,7 +21,13 @@ type Conversation = {
   title: string;
   updated_at: string;
 };
-type Message = { id: string; role: "user" | "assistant"; content: string };
+type MessageAttachment = { filename: string; size_bytes: number };
+type Message = {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  attachments?: MessageAttachment[];
+};
 type ProjectFile = { path: string; size_bytes: number; modified_at: string };
 type FileProposal = {
   projectId: string;
@@ -43,6 +50,14 @@ function apiBase() {
 
 const BASE = apiBase();
 const storedToken = () => sessionStorage.getItem("nexus-token") ?? "";
+const attachmentExtensions = new Set([
+  ".c", ".cc", ".cfg", ".cpp", ".cs", ".css", ".csv", ".diff", ".go",
+  ".h", ".hpp", ".html", ".ini", ".java", ".js", ".json", ".jsx", ".log",
+  ".md", ".php", ".py", ".rb", ".rs", ".sh", ".sql", ".svg", ".toml",
+  ".ts", ".tsx", ".txt", ".xml", ".yaml", ".yml",
+]);
+const maxAttachmentBytes = 32_768;
+const maxTotalAttachmentBytes = 65_536;
 
 export default function App() {
   const [project, setProject] = useState("default");
@@ -53,6 +68,7 @@ export default function App() {
   const [projectFiles, setProjectFiles] = useState<ProjectFile[]>([]);
   const [conversationId, setConversationId] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
+  const [attachments, setAttachments] = useState<File[]>([]);
   const [fileMode, setFileMode] = useState(false);
   const [filePath, setFilePath] = useState("");
   const [fileProposal, setFileProposal] = useState<FileProposal | null>(null);
@@ -63,6 +79,7 @@ export default function App() {
   const [error, setError] = useState("");
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const attachmentInputRef = useRef<HTMLInputElement>(null);
 
   const headers = useMemo(
     () => ({
@@ -119,6 +136,7 @@ export default function App() {
   const loadMessages = useCallback(
     async (id: string) => {
       try {
+        setAttachments([]);
         const response = await request(
           `/api/conversations/${id}/messages?project_id=${encodeURIComponent(project)}`,
         );
@@ -150,6 +168,7 @@ export default function App() {
     setConversationId("");
     setMessages([]);
     setFileProposal(null);
+    setAttachments([]);
     void loadConversationList();
     void loadProjectFiles();
   }, [project, loadConversationList, loadProjectFiles]);
@@ -172,6 +191,7 @@ export default function App() {
     if (clearMessages) {
       setMessages([]);
       setFileProposal(null);
+      setAttachments([]);
     }
     setConversations((old) => [created, ...old]);
     setSidebarOpen(false);
@@ -188,7 +208,8 @@ export default function App() {
 
   const sendMessage = async (event: FormEvent) => {
     event.preventDefault();
-    const text = draft.trim();
+    const pendingFiles = [...attachments];
+    const text = draft.trim() || (pendingFiles.length ? "Please review the attached file(s)." : "");
     if (!text || loading || fileProposal) return;
     if (fileMode && !filePath.trim()) {
       setError("Enter a relative path for the file you want NEXUS to draft.");
@@ -197,16 +218,27 @@ export default function App() {
     setDraft("");
     setError("");
     setLoading(true);
-    const userMessage: Message = { id: crypto.randomUUID(), role: "user", content: text };
+    const userMessage: Message = {
+      id: crypto.randomUUID(),
+      role: "user",
+      content: text,
+      attachments: pendingFiles.map((file) => ({ filename: file.name, size_bytes: file.size })),
+    };
     const assistantId = crypto.randomUUID();
     setMessages((old) => [...old, userMessage, { id: assistantId, role: "assistant", content: "" }]);
     let conversationCreated = false;
     try {
       let activeConversation = conversationId;
       if (!activeConversation) {
-        activeConversation = await createConversation(false, text);
+        activeConversation = await createConversation(
+          false,
+          draft.trim() || pendingFiles.map((file) => file.name).join(", "),
+        );
         conversationCreated = true;
       }
+      const requestAttachments = await Promise.all(
+        pendingFiles.map(async (file) => ({ filename: file.name, content: await file.text() })),
+      );
       const response = await request(
         `/api/conversations/${activeConversation}/messages/stream`,
         {
@@ -214,6 +246,7 @@ export default function App() {
           body: JSON.stringify({
             project_id: project,
             content: text,
+            attachments: requestAttachments,
             create_file: fileMode,
             ...(fileMode ? { file_path: filePath.trim() } : {}),
           }),
@@ -261,6 +294,7 @@ export default function App() {
         }
       }
       if (streamError) throw new Error(streamError);
+      setAttachments([]);
       await Promise.all([loadConversationList(), loadCapabilities(), loadProjectFiles()]);
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : "The request failed.";
@@ -275,6 +309,34 @@ export default function App() {
     } finally {
       setLoading(false);
     }
+  };
+
+  const addAttachments = (files: FileList | null) => {
+    if (!files?.length) return;
+    const selected = Array.from(files);
+    const currentBytes = attachments.reduce((total, file) => total + file.size, 0);
+    const incomingBytes = selected.reduce((total, file) => total + file.size, 0);
+    const invalid = selected.find((file) => {
+      const extension = file.name.slice(file.name.lastIndexOf(".")).toLowerCase();
+      return (
+        file.name.startsWith(".env") ||
+        /\.(pem|key|p12|pfx|secret|credentials)$/i.test(file.name) ||
+        !attachmentExtensions.has(extension)
+      );
+    });
+    if (invalid) {
+      setError(`${invalid.name} is not a supported text/code file. Secret and binary files are not allowed.`);
+    } else if (attachments.length + selected.length > 3) {
+      setError("Attach up to 3 files per message.");
+    } else if (currentBytes + incomingBytes > maxTotalAttachmentBytes) {
+      setError("Attachments together must be no larger than 64 KiB.");
+    } else if (selected.some((file) => file.size > maxAttachmentBytes)) {
+      setError("Each attachment must be no larger than 32 KiB.");
+    } else {
+      setAttachments((current) => [...current, ...selected]);
+      setError("");
+    }
+    if (attachmentInputRef.current) attachmentInputRef.current.value = "";
   };
 
   const approveFileProposal = async () => {
@@ -343,7 +405,29 @@ export default function App() {
         </div>
       </aside>
       <section className="main-panel">
-        <header className="topbar"><div className="topbar-left"><button className="icon-button mobile-menu" onClick={() => setSidebarOpen(true)} aria-label="Open menu"><Menu size={19} /></button><div className="crumb">Workspace <span>/</span> <b>{project}</b></div></div><div className="system-status"><span className={`status-dot ${capabilities?.inference_available ? "online" : ""}`} />{!capabilities ? "API unavailable" : capabilities.inference_available ? "Inference ready" : "Waiting for model"}</div></header>
+        <header className="topbar">
+          <div className="topbar-left">
+            <button className="icon-button mobile-menu" onClick={() => setSidebarOpen(true)} aria-label="Open menu"><Menu size={19} /></button>
+            <nav className="conversation-tabs" aria-label="Recent conversation tabs">
+              {conversations.slice(0, 4).map((conversation) => (
+                <button
+                  key={conversation.id}
+                  type="button"
+                  className={`conversation-tab ${conversation.id === conversationId ? "conversation-tab-active" : ""}`}
+                  onClick={() => {
+                    setConversationId(conversation.id);
+                    void loadMessages(conversation.id);
+                  }}
+                  title={conversation.title}
+                >
+                  <span>{conversation.title}</span>
+                </button>
+              ))}
+              <button type="button" className="tab-new" onClick={() => void startNewConversation()} aria-label="New conversation"><Plus size={16} /></button>
+            </nav>
+          </div>
+          <div className="system-status"><span className={`status-dot ${capabilities?.inference_available ? "online" : ""}`} />{!capabilities ? "API unavailable" : capabilities.inference_available ? "Inference ready" : "Waiting for model"}</div>
+        </header>
         <div className={`content ${messages.length ? "chat-content" : ""}`}>
           {messages.length === 0 && !fileProposal ? <div className="welcome">
             <div className="welcome-orbit"><div className="welcome-logo"><Bot size={29} /></div><span className="orbit-dot orbit-one" /><span className="orbit-dot orbit-two" /></div>
@@ -379,6 +463,16 @@ export default function App() {
                           ""
                         ))}
                     </div>
+                    {!!message.attachments?.length && (
+                        <div className="message-attachments">
+                          {message.attachments.map((attachment) => (
+                            <span className="message-attachment" key={attachment.filename}>
+                              <Paperclip size={12} />
+                              {attachment.filename}
+                            </span>
+                          ))}
+                        </div>
+                    )}
                   </div>
                 </article>
               ))}
@@ -432,6 +526,33 @@ export default function App() {
         {authRequired && <div className="auth-row"><Shield size={15} /><label htmlFor="api-token">API token</label><input id="api-token" type="password" autoComplete="off" placeholder="Paste NEXUS_API_TOKEN" value={token} onChange={(event) => { setToken(event.target.value); sessionStorage.setItem("nexus-token", event.target.value); }} /></div>}
         <form className="composer-wrap" onSubmit={sendMessage}>
           <div className="composer">
+            <input
+              ref={attachmentInputRef}
+              className="attachment-input"
+              type="file"
+              multiple
+              accept={[...attachmentExtensions].join(",")}
+              onChange={(event) => addAttachments(event.target.files)}
+              aria-label="Choose text or code files to attach"
+            />
+            {!!attachments.length && (
+              <div className="pending-attachments" aria-label="Files to attach">
+                {attachments.map((file, index) => (
+                  <span className="pending-attachment" key={`${file.name}-${index}`}>
+                    <Paperclip size={12} />
+                    {file.name}
+                    <button
+                      type="button"
+                      onClick={() => setAttachments((current) => current.filter((_, itemIndex) => itemIndex !== index))}
+                      aria-label={`Remove ${file.name}`}
+                      disabled={loading}
+                    >
+                      <X size={12} />
+                    </button>
+                  </span>
+                ))}
+              </div>
+            )}
             {fileMode && (
               <input
                 className="file-path-input"
@@ -457,6 +578,16 @@ export default function App() {
               aria-label={fileMode ? "Describe a project file" : "Message NEXUS"}
             />
             <div className="composer-tools">
+              <button
+                type="button"
+                className="attach-button"
+                onClick={() => attachmentInputRef.current?.click()}
+                disabled={loading || attachments.length >= 3}
+                aria-label="Attach text or code files"
+                title="Attach text/code files (up to 3, 64 KiB total)"
+              >
+                <Paperclip size={16} />
+              </button>
               <span>
                 <span className="composer-dot" />{" "}
                 {!capabilities
