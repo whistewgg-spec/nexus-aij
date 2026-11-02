@@ -7,7 +7,7 @@ import sqlite3
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import AsyncIterator
 
 import httpx
@@ -86,6 +86,13 @@ class ConversationCreate(BaseModel):
 class MessageCreate(BaseModel):
     project_id: str = Field(default="default", min_length=1, max_length=64)
     content: str = Field(min_length=1, max_length=20_000)
+    create_file: bool = False
+    file_path: str | None = Field(default=None, max_length=240)
+
+
+class ProjectFileCreate(BaseModel):
+    path: str = Field(min_length=1, max_length=240)
+    content: str = Field(max_length=262_144)
 
 
 def validate_project_id(project_id: str) -> str:
@@ -95,6 +102,76 @@ def validate_project_id(project_id: str) -> str:
             detail="Project IDs must be 1-64 letters, digits, dots, underscores, or hyphens.",
         )
     return project_id
+
+
+def project_files_root(project_id: str) -> Path:
+    validate_project_id(project_id)
+    root = Path(os.getenv("NEXUS_DATA_DIR", str(DEFAULT_DATA_DIR))) / "projects"
+    root.mkdir(parents=True, exist_ok=True)
+    if root.is_symlink():
+        raise HTTPException(status_code=400, detail="Projects directory cannot be a symlink.")
+    root = root.resolve()
+    project = root / project_id
+    if project.is_symlink():
+        raise HTTPException(status_code=400, detail="Project directory cannot be a symlink.")
+    project.mkdir(exist_ok=True)
+    return project
+
+
+def validate_project_file_path(raw_path: str) -> PurePosixPath:
+    if (
+        not raw_path
+        or "\x00" in raw_path
+        or "\\" in raw_path
+        or ":" in raw_path
+        or raw_path.startswith("/")
+    ):
+        raise HTTPException(status_code=422, detail="Use a relative project file path.")
+    path = PurePosixPath(raw_path)
+    if not path.parts or any(
+        part in {"", ".", "..", ".git", ".env"} for part in path.parts
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Project file path cannot contain traversal or protected directories.",
+        )
+    return path
+
+
+def create_project_file(project_id: str, raw_path: str, content: str) -> dict:
+    if len(content.encode("utf-8")) > 262_144:
+        raise HTTPException(status_code=413, detail="Project files are limited to 256 KiB.")
+    path = validate_project_file_path(raw_path)
+    project_root = project_files_root(project_id)
+    current = project_root
+    for part in path.parts[:-1]:
+        current = current / part
+        try:
+            current.mkdir(exist_ok=True)
+        except FileExistsError:
+            pass
+        if current.is_symlink() or not current.is_dir():
+            raise HTTPException(
+                status_code=400,
+                detail="Project file path cannot traverse a symlink or non-directory.",
+            )
+    destination = current / path.parts[-1]
+    try:
+        with destination.open("x", encoding="utf-8", newline="\n") as output:
+            output.write(content)
+    except FileExistsError:
+        raise HTTPException(
+            status_code=409,
+            detail="That file already exists; NEXUS only creates new files in this first version.",
+        ) from None
+    except OSError as error:
+        raise HTTPException(status_code=500, detail=f"Could not create project file: {error}") from error
+    info = destination.stat()
+    return {
+        "path": path.as_posix(),
+        "size_bytes": info.st_size,
+        "created_at": datetime.fromtimestamp(info.st_mtime, timezone.utc).isoformat(),
+    }
 
 
 def require_auth(authorization: str | None) -> None:
@@ -131,7 +208,7 @@ def now_iso() -> str:
 def model_path() -> str:
     return os.getenv(
         "NEXUS_MODEL_PATH",
-        str(DEFAULT_DATA_DIR / "models" / "Qwen2.5-0.5B-Instruct-Q4_K_M.gguf"),
+        str(DEFAULT_DATA_DIR / "models" / "Qwen2.5-Coder-3B-Instruct-Q4_K_M.gguf"),
     )
 
 
@@ -248,6 +325,41 @@ async def capabilities():
     }
 
 
+@app.get("/api/projects/{project_id}/files")
+async def list_project_files(
+    project_id: str,
+    authorization: str | None = Header(default=None),
+):
+    require_auth(authorization)
+    root = project_files_root(project_id)
+    files = []
+    for candidate in root.rglob("*"):
+        if candidate.is_symlink():
+            continue
+        if candidate.is_file():
+            info = candidate.stat()
+            files.append(
+                {
+                    "path": candidate.relative_to(root).as_posix(),
+                    "size_bytes": info.st_size,
+                    "modified_at": datetime.fromtimestamp(
+                        info.st_mtime, timezone.utc
+                    ).isoformat(),
+                }
+            )
+    return sorted(files, key=lambda item: item["path"])
+
+
+@app.post("/api/projects/{project_id}/files", status_code=201)
+async def create_project_file_endpoint(
+    project_id: str,
+    body: ProjectFileCreate,
+    authorization: str | None = Header(default=None),
+):
+    require_auth(authorization)
+    return create_project_file(project_id, body.path, body.content)
+
+
 @app.get("/api/conversations")
 async def list_conversations(
     project_id: str = Query(default="default", min_length=1, max_length=64),
@@ -311,18 +423,64 @@ async def list_messages(
     return [dict(row) for row in rows]
 
 
-async def inference_tokens(messages: list[dict]) -> AsyncIterator[str]:
+async def inference_events(
+    messages: list[dict], file_path: str | None = None
+) -> AsyncIterator[dict]:
     timeout = httpx.Timeout(connect=10.0, read=180.0, write=30.0, pool=10.0)
+    payload: dict = {
+        "model": "local",
+        "messages": messages,
+        "stream": True,
+        "temperature": 0.7,
+    }
+    if file_path is not None:
+        payload["tools"] = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "create_file",
+                    "description": "Draft the contents for one new file. Do not write it; the user must review and approve the draft.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "content": {
+                                "type": "string",
+                                "description": "Complete contents for the requested file.",
+                            },
+                            "summary": {
+                                "type": "string",
+                                "description": "Brief description of what this file contains.",
+                            },
+                        },
+                        "required": ["content", "summary"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ]
+        payload["tool_choice"] = {
+            "type": "function",
+            "function": {"name": "create_file"},
+        }
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "The user explicitly asked you to draft one project file. "
+                    f"Use the create_file function for the requested path {file_path!r}. "
+                    "Return the complete useful file contents and a short summary. "
+                    "The file will not be written unless the user approves it."
+                ),
+            },
+            *messages,
+        ]
+        payload["messages"] = messages
+    tool_calls: dict[int, dict[str, str]] = {}
     async with httpx.AsyncClient(timeout=timeout) as client:
         async with client.stream(
             "POST",
             f"{INFERENCE_URL}/v1/chat/completions",
-            json={
-                "model": "local",
-                "messages": messages,
-                "stream": True,
-                "temperature": 0.7,
-            },
+            json=payload,
         ) as response:
             response.raise_for_status()
             async for line in response.aiter_lines():
@@ -332,11 +490,40 @@ async def inference_tokens(messages: list[dict]) -> AsyncIterator[str]:
                 if payload == "[DONE]":
                     break
                 try:
-                    token = json.loads(payload)["choices"][0]["delta"].get("content", "")
+                    delta = json.loads(payload)["choices"][0]["delta"]
                 except (KeyError, IndexError, TypeError, json.JSONDecodeError):
                     continue
+                token = delta.get("content", "")
                 if token:
-                    yield token
+                    yield {"type": "token", "token": token}
+                for call in delta.get("tool_calls", []):
+                    index = call.get("index", 0)
+                    accumulated = tool_calls.setdefault(
+                        index, {"name": "", "arguments": ""}
+                    )
+                    function = call.get("function", {})
+                    accumulated["name"] += function.get("name", "")
+                    accumulated["arguments"] += function.get("arguments", "")
+
+    if file_path is not None:
+        if len(tool_calls) != 1 or tool_calls.get(0, {}).get("name") != "create_file":
+            raise RuntimeError("The model did not return one valid file draft.")
+        try:
+            draft = json.loads(tool_calls[0]["arguments"])
+        except (json.JSONDecodeError, KeyError) as error:
+            raise RuntimeError("The model returned invalid file draft data.") from error
+        content = draft.get("content")
+        summary = draft.get("summary")
+        if not isinstance(content, str) or not isinstance(summary, str):
+            raise RuntimeError("The model returned an incomplete file draft.")
+        if len(content.encode("utf-8")) > 262_144:
+            raise RuntimeError("The generated file exceeds the 256 KiB limit.")
+        yield {
+            "type": "file_proposal",
+            "path": file_path,
+            "content": content,
+            "summary": summary,
+        }
 
 
 def event(payload: dict) -> str:
@@ -351,6 +538,13 @@ async def stream_message(
 ):
     require_auth(authorization)
     project_id = validate_project_id(body.project_id)
+    if body.create_file:
+        if not body.file_path:
+            raise HTTPException(
+                status_code=422,
+                detail="Choose a relative file path before asking NEXUS to create a file.",
+            )
+        validate_project_file_path(body.file_path)
     with connect_db() as db:
         conversation = db.execute(
             "SELECT id FROM conversations WHERE id = ? AND project_id = ?",
@@ -377,20 +571,24 @@ async def stream_message(
         try:
             if not await inference_health():
                 raise RuntimeError("Local model server is unavailable. Run scripts/start.sh.")
-            async for token in inference_tokens(messages):
-                response_text += token
-                yield event({"type": "token", "token": token})
-            if not response_text:
+            async for item in inference_events(
+                messages, body.file_path if body.create_file else None
+            ):
+                if item["type"] == "token":
+                    response_text += item["token"]
+                yield event(item)
+            if not response_text and not body.create_file:
                 raise RuntimeError("The local model returned an empty response.")
-            with connect_db() as db:
-                db.execute(
-                    "INSERT INTO messages (id, conversation_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)",
-                    (str(uuid.uuid4()), conversation_id, "assistant", response_text, now_iso()),
-                )
-                db.execute(
-                    "UPDATE conversations SET updated_at = ? WHERE id = ?",
-                    (now_iso(), conversation_id),
-                )
+            if response_text:
+                with connect_db() as db:
+                    db.execute(
+                        "INSERT INTO messages (id, conversation_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)",
+                        (str(uuid.uuid4()), conversation_id, "assistant", response_text, now_iso()),
+                    )
+                    db.execute(
+                        "UPDATE conversations SET updated_at = ? WHERE id = ?",
+                        (now_iso(), conversation_id),
+                    )
             yield event({"type": "done"})
         except (httpx.HTTPError, asyncio.TimeoutError, RuntimeError) as exc:
             yield event({"type": "error", "message": str(exc)})

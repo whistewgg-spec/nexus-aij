@@ -68,6 +68,48 @@ def test_conversations_are_isolated_by_project(client):
     )
 
 
+def test_project_files_are_listed_and_created_without_overwriting(client):
+    created = client.post(
+        "/api/projects/demo/files",
+        json={"path": "src/main.py", "content": "print('hello')\n"},
+    )
+
+    assert created.status_code == 201
+    assert created.json()["path"] == "src/main.py"
+    assert (
+        client.get("/api/projects/demo/files").json()[0]["path"] == "src/main.py"
+    )
+    assert (
+        client.post(
+            "/api/projects/demo/files",
+            json={"path": "src/main.py", "content": "overwritten"},
+        ).status_code
+        == 409
+    )
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["../outside.txt", "/absolute.txt", ".env", ".git/config", "folder/../secret"],
+)
+def test_project_file_creation_rejects_unsafe_paths(client, path):
+    response = client.post(
+        "/api/projects/demo/files",
+        json={"path": path, "content": "must not escape the project"},
+    )
+
+    assert response.status_code == 422
+
+
+def test_project_files_are_separated_by_project(client):
+    client.post(
+        "/api/projects/alpha/files",
+        json={"path": "hello.txt", "content": "alpha"},
+    )
+
+    assert client.get("/api/projects/beta/files").json() == []
+
+
 def test_message_stream_persists_user_and_assistant_messages(client, monkeypatch):
     conversation = client.post(
         "/api/conversations", json={"project_id": "demo"}
@@ -76,13 +118,14 @@ def test_message_stream_persists_user_and_assistant_messages(client, monkeypatch
     async def available():
         return True
 
-    async def tokens(messages):
+    async def events(messages, file_path=None):
         assert messages[-1] == {"role": "user", "content": "Hello"}
-        yield "Hello"
-        yield " from NEXUS"
+        assert file_path is None
+        yield {"type": "token", "token": "Hello"}
+        yield {"type": "token", "token": " from NEXUS"}
 
     monkeypatch.setattr(main, "inference_health", available)
-    monkeypatch.setattr(main, "inference_tokens", tokens)
+    monkeypatch.setattr(main, "inference_events", events)
     response = client.post(
         f"/api/conversations/{conversation['id']}/messages/stream",
         json={"project_id": "demo", "content": "Hello"},
@@ -144,6 +187,166 @@ def test_unavailable_inference_returns_error_without_fake_assistant_message(
     ]
 
 
+def test_file_request_returns_a_draft_without_writing_until_confirmation(
+    client, monkeypatch, tmp_path
+):
+    conversation = client.post(
+        "/api/conversations", json={"project_id": "demo"}
+    ).json()
+
+    async def available():
+        return True
+
+    async def events(messages, file_path=None):
+        assert file_path == "src/main.py"
+        yield {
+            "type": "file_proposal",
+            "path": file_path,
+            "content": "print('generated')\n",
+            "summary": "A hello-world script.",
+        }
+
+    monkeypatch.setattr(main, "inference_health", available)
+    monkeypatch.setattr(main, "inference_events", events)
+    response = client.post(
+        f"/api/conversations/{conversation['id']}/messages/stream",
+        json={
+            "project_id": "demo",
+            "content": "Create a hello-world Python script.",
+            "create_file": True,
+            "file_path": "src/main.py",
+        },
+    )
+
+    events_received = [
+        json.loads(line[6:])
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    assert events_received[0]["type"] == "file_proposal"
+    assert events_received[-1] == {"type": "done"}
+    assert client.get("/api/projects/demo/files").json() == []
+
+    created = client.post(
+        "/api/projects/demo/files",
+        json={
+            "path": events_received[0]["path"],
+            "content": events_received[0]["content"],
+        },
+    )
+    assert created.status_code == 201
+    assert (
+        tmp_path / "projects" / "demo" / "src" / "main.py"
+    ).read_text() == "print('generated')\n"
+
+
+def test_file_request_uses_model_tool_call_and_emits_reviewable_draft(monkeypatch):
+    requests = []
+
+    def handle_request(request):
+        requests.append(request)
+        tool_args = json.dumps(
+            {"content": "print('hello')\n", "summary": "A hello script."}
+        )
+        chunks = [
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "function": {
+                                        "name": "create_file",
+                                        "arguments": tool_args[:20],
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "function": {
+                                        "arguments": tool_args[20:],
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+        ]
+        stream = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=(stream + "data: [DONE]\n\n"),
+        )
+
+    transport = httpx.MockTransport(handle_request)
+    real_async_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        main.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_async_client(transport=transport, **kwargs),
+    )
+
+    async def consume():
+        return [
+            item
+            async for item in main.inference_events(
+                [{"role": "user", "content": "Make a script"}], "src/main.py"
+            )
+        ]
+
+    import anyio
+
+    items = anyio.run(consume)
+
+    assert items == [
+        {
+            "type": "file_proposal",
+            "path": "src/main.py",
+            "content": "print('hello')\n",
+            "summary": "A hello script.",
+        }
+    ]
+    payload = json.loads(requests[0].content)
+    assert payload["tool_choice"]["function"]["name"] == "create_file"
+    assert payload["messages"][0]["role"] == "system"
+
+
+def test_file_request_requires_safe_path_before_storing_message(client):
+    conversation = client.post(
+        "/api/conversations", json={"project_id": "demo"}
+    ).json()
+    response = client.post(
+        f"/api/conversations/{conversation['id']}/messages/stream",
+        json={
+            "project_id": "demo",
+            "content": "Create a file",
+            "create_file": True,
+            "file_path": "../outside.py",
+        },
+    )
+
+    assert response.status_code == 422
+    assert (
+        client.get(
+            f"/api/conversations/{conversation['id']}/messages",
+            params={"project_id": "demo"},
+        ).json()
+        == []
+    )
+
+
 @pytest.mark.anyio
 async def test_inference_client_parses_openai_compatible_sse(monkeypatch):
     requests = []
@@ -167,14 +370,17 @@ async def test_inference_client_parses_openai_compatible_sse(monkeypatch):
         lambda **kwargs: real_async_client(transport=transport, **kwargs),
     )
 
-    tokens = [
+    events = [
         token
-        async for token in main.inference_tokens(
+        async for token in main.inference_events(
             [{"role": "user", "content": "Hello"}]
         )
     ]
 
-    assert tokens == ["Local ", "reply"]
+    assert events == [
+        {"type": "token", "token": "Local "},
+        {"type": "token", "token": "reply"},
+    ]
     request_payload = json.loads(requests[0].content)
     assert "max_tokens" not in request_payload
 

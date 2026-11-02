@@ -16,9 +16,9 @@ if [[ -f .env ]]; then
   set +a
 fi
 
-MODEL_PATH="${NEXUS_MODEL_PATH:-$ROOT/data/models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf}"
+MODEL_PATH="${NEXUS_MODEL_PATH:-$ROOT/data/models/Qwen2.5-Coder-3B-Instruct-Q4_K_M.gguf}"
 if [[ ! -s "$MODEL_PATH" ]]; then
-  echo "Downloading the public Qwen2.5 0.5B GGUF model (~400 MiB)..."
+  echo "Downloading the public Qwen2.5-Coder 3B GGUF model (~1.8 GiB)..."
   .venv/bin/python scripts/download-model.py
 fi
 export NEXUS_MODEL_PATH="$MODEL_PATH"

@@ -4,6 +4,7 @@ import {
   Bot,
   ChevronDown,
   Cpu,
+  FilePlus2,
   FolderOpen,
   Menu,
   MessageSquare,
@@ -20,6 +21,13 @@ type Conversation = {
   updated_at: string;
 };
 type Message = { id: string; role: "user" | "assistant"; content: string };
+type ProjectFile = { path: string; size_bytes: number; modified_at: string };
+type FileProposal = {
+  projectId: string;
+  path: string;
+  content: string;
+  summary: string;
+};
 type Capabilities = {
   inference_available: boolean;
   model_available: boolean;
@@ -43,8 +51,13 @@ export default function App() {
   const [token, setToken] = useState(storedToken);
   const [authRequired, setAuthRequired] = useState(false);
   const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [projectFiles, setProjectFiles] = useState<ProjectFile[]>([]);
   const [conversationId, setConversationId] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
+  const [fileMode, setFileMode] = useState(false);
+  const [filePath, setFilePath] = useState("");
+  const [fileProposal, setFileProposal] = useState<FileProposal | null>(null);
+  const [savingFile, setSavingFile] = useState(false);
   const [capabilities, setCapabilities] = useState<Capabilities | null>(null);
   const [draft, setDraft] = useState("");
   const [loading, setLoading] = useState(false);
@@ -95,6 +108,15 @@ export default function App() {
     }
   }, [project, request]);
 
+  const loadProjectFiles = useCallback(async () => {
+    try {
+      const response = await request(`/api/projects/${encodeURIComponent(project)}/files`);
+      setProjectFiles(await response.json());
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not load project files.");
+    }
+  }, [project, request]);
+
   const loadMessages = useCallback(
     async (id: string) => {
       try {
@@ -128,8 +150,10 @@ export default function App() {
   useEffect(() => {
     setConversationId("");
     setMessages([]);
+    setFileProposal(null);
     void loadConversationList();
-  }, [project, loadConversationList]);
+    void loadProjectFiles();
+  }, [project, loadConversationList, loadProjectFiles]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -146,7 +170,10 @@ export default function App() {
     });
     const created: Conversation = await response.json();
     setConversationId(created.id);
-    if (clearMessages) setMessages([]);
+    if (clearMessages) {
+      setMessages([]);
+      setFileProposal(null);
+    }
     setConversations((old) => [created, ...old]);
     setSidebarOpen(false);
     return created.id;
@@ -163,7 +190,11 @@ export default function App() {
   const sendMessage = async (event: FormEvent) => {
     event.preventDefault();
     const text = draft.trim();
-    if (!text || loading) return;
+    if (!text || loading || fileProposal) return;
+    if (fileMode && !filePath.trim()) {
+      setError("Enter a relative path for the file you want NEXUS to draft.");
+      return;
+    }
     setDraft("");
     setError("");
     setLoading(true);
@@ -179,7 +210,15 @@ export default function App() {
       }
       const response = await request(
         `/api/conversations/${activeConversation}/messages/stream`,
-        { method: "POST", body: JSON.stringify({ project_id: project, content: text }) },
+        {
+          method: "POST",
+          body: JSON.stringify({
+            project_id: project,
+            content: text,
+            create_file: fileMode,
+            ...(fileMode ? { file_path: filePath.trim() } : {}),
+          }),
+        },
       );
       if (!response.body) throw new Error("Streaming is unavailable in this browser.");
       const reader = response.body.getReader();
@@ -204,11 +243,26 @@ export default function App() {
                   : message,
               ),
             );
+          } else if (data.type === "file_proposal") {
+            if (
+              typeof data.path !== "string" ||
+              typeof data.content !== "string" ||
+              typeof data.summary !== "string"
+            ) {
+              throw new Error("The model returned an invalid file draft.");
+            }
+            setFileProposal({
+              projectId: project,
+              path: data.path,
+              content: data.content,
+              summary: data.summary,
+            });
+            setMessages((old) => old.filter((message) => message.id !== assistantId));
           } else if (data.type === "error") streamError = data.message;
         }
       }
       if (streamError) throw new Error(streamError);
-      await Promise.all([loadConversationList(), loadCapabilities()]);
+      await Promise.all([loadConversationList(), loadCapabilities(), loadProjectFiles()]);
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : "The request failed.";
       setMessages((old) =>
@@ -221,6 +275,29 @@ export default function App() {
       setDraft(text);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const approveFileProposal = async () => {
+    if (savingFile || !fileProposal || fileProposal.projectId !== project) return;
+    try {
+      setSavingFile(true);
+      setError("");
+      await request(`/api/projects/${encodeURIComponent(project)}/files`, {
+        method: "POST",
+        body: JSON.stringify({
+          path: fileProposal.path,
+          content: fileProposal.content,
+        }),
+      });
+      setFileProposal(null);
+      setFileMode(false);
+      setFilePath("");
+      await loadProjectFiles();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not create project file.");
+    } finally {
+      setSavingFile(false);
     }
   };
 
@@ -251,6 +328,16 @@ export default function App() {
           {conversations.map((conversation) => <button key={conversation.id} className={`history-item ${conversation.id === conversationId ? "history-active" : ""}`} onClick={() => { setConversationId(conversation.id); setSidebarOpen(false); void loadMessages(conversation.id); }}><MessageSquare size={15} /><span>{conversation.title}</span></button>)}
           {!conversations.length && <div className="empty-history">Your conversations will appear here.</div>}
         </div>
+        <div className="history-title">PROJECT FILES</div>
+        <div className="project-files">
+          {projectFiles.map((file) => (
+            <div className="project-file" key={file.path} title={`${file.path} · ${file.size_bytes} bytes`}>
+              <FilePlus2 size={13} />
+              <span>{file.path}</span>
+            </div>
+          ))}
+          {!projectFiles.length && <div className="empty-history">Files you approve will appear here.</div>}
+        </div>
         <div className="sidebar-bottom">
           <div className="local-badge"><span className={`status-dot ${capabilities?.inference_available ? "online" : ""}`} /><span>{capabilities?.inference_available ? "Local model online" : "Model not running"}</span></div>
           <div className="sidebar-foot">Private by design <Shield size={13} /></div>
@@ -259,18 +346,152 @@ export default function App() {
       <section className="main-panel">
         <header className="topbar"><div className="topbar-left"><button className="icon-button mobile-menu" onClick={() => setSidebarOpen(true)} aria-label="Open menu"><Menu size={19} /></button><div className="crumb">Workspace <span>/</span> <b>{project}</b></div></div><div className="system-status"><span className={`status-dot ${capabilities?.inference_available ? "online" : ""}`} />{capabilities?.inference_available ? "Inference ready" : "Waiting for model"}</div></header>
         <div className={`content ${messages.length ? "chat-content" : ""}`}>
-          {messages.length === 0 ? <div className="welcome">
+          {messages.length === 0 && !fileProposal ? <div className="welcome">
             <div className="welcome-orbit"><div className="welcome-logo"><Bot size={29} /></div><span className="orbit-dot orbit-one" /><span className="orbit-dot orbit-two" /></div>
             <div className="eyebrow"><span /> YOUR PRIVATE AI WORKSPACE</div>
             <h1>Think clearly.<br /><span>Build anything.</span></h1>
             <p className="welcome-description">A capable AI, running close to your work.<br />Your conversations stay in this workspace.</p>
             <div className="suggestions"><button onClick={() => setDraft("Explain how this project works.")}> <span>01</span> Explain how this project works <span>↗</span></button><button onClick={() => setDraft("Help me think through an idea.")}><span>02</span> Help me think through an idea <span>↗</span></button><button onClick={() => setDraft("Write a Python script that...")}><span>03</span> Write a Python script that... <span>↗</span></button></div>
             <div className="capability-card"><div className="capability-icon"><Cpu size={17} /></div><div className="capability-copy"><b>{capabilities?.model_path ?? "Qwen 2.5 · 0.5B"}</b><span>{capabilities?.inference_available ? "Running locally via llama.cpp" : capabilities?.model_available ? "Model downloaded · server stopped" : "Waiting for setup · CPU inference"}</span></div><div className="capability-resource"><Activity size={14} /><span>{capabilities ? `${capabilities.resources.cpu_count} CPU · ${capabilities.resources.context_tokens} ctx` : "Detecting resources"}</span></div></div>
-          </div> : <div className="messages">{messages.map((message) => <article key={message.id} className={`message message-${message.role}`}><div className="message-avatar">{message.role === "user" ? "Y" : <Bot size={18} />}</div><div className="message-body"><div className="message-label">{message.role === "user" ? "YOU" : "NEXUS"} <span>·</span> {message.role === "assistant" ? "LOCAL MODEL" : "NOW"}</div><div className="message-text">{message.content || (loading ? <span className="typing"><i /><i /><i /></span> : "")}</div></div></article>)}<div ref={bottomRef} /></div>}
+          </div> : (
+            <div className="messages">
+              {messages.map((message) => (
+                <article
+                  key={message.id}
+                  className={`message message-${message.role}`}
+                >
+                  <div className="message-avatar">
+                    {message.role === "user" ? "Y" : <Bot size={18} />}
+                  </div>
+                  <div className="message-body">
+                    <div className="message-label">
+                      {message.role === "user" ? "YOU" : "NEXUS"} <span>·</span>{" "}
+                      {message.role === "assistant" ? "LOCAL MODEL" : "NOW"}
+                    </div>
+                    <div className="message-text">
+                      {message.content ||
+                        (loading ? (
+                          <span className="typing">
+                            <i />
+                            <i />
+                            <i />
+                          </span>
+                        ) : (
+                          ""
+                        ))}
+                    </div>
+                  </div>
+                </article>
+              ))}
+              {fileProposal && (
+                <section className="file-proposal" aria-label="Review generated file">
+                  <div className="file-proposal-heading">
+                    <FilePlus2 size={16} />
+                    <div>
+                      <b>Review file before creating</b>
+                      <span>{fileProposal.summary}</span>
+                    </div>
+                  </div>
+                  <div className="file-proposal-path">{fileProposal.path}</div>
+                  <textarea
+                    className="file-proposal-content"
+                    value={fileProposal.content}
+                    onChange={(event) =>
+                      setFileProposal({ ...fileProposal, content: event.target.value })
+                    }
+                    aria-label="Review and edit proposed file contents"
+                  />
+                  <div className="file-proposal-actions">
+                    <button
+                      type="button"
+                      className="file-cancel"
+                      onClick={() => setFileProposal(null)}
+                      disabled={savingFile}
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="button"
+                      className="file-approve"
+                      onClick={() => void approveFileProposal()}
+                      disabled={savingFile}
+                    >
+                      {savingFile ? "Creating…" : "Create file"}
+                    </button>
+                  </div>
+                  <p>
+                    Nothing is written until you choose “Create file”. New files only;
+                    existing files are never overwritten.
+                  </p>
+                </section>
+              )}
+              <div ref={bottomRef} />
+            </div>
+          )}
           {error && <div className="error-banner" role="alert">{error}<button onClick={() => setError("")} aria-label="Dismiss error"><X size={16} /></button></div>}
         </div>
         {authRequired && <div className="auth-row"><Shield size={15} /><label htmlFor="api-token">API token</label><input id="api-token" type="password" autoComplete="off" placeholder="Paste NEXUS_API_TOKEN" value={token} onChange={(event) => { setToken(event.target.value); sessionStorage.setItem("nexus-token", event.target.value); }} /></div>}
-        <form className="composer-wrap" onSubmit={sendMessage}><div className="composer"><textarea value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="Message NEXUS..." rows={1} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void sendMessage(event); } }} aria-label="Message NEXUS" /><div className="composer-tools"><span><span className="composer-dot" /> {capabilities?.inference_available ? "Local inference ready" : "Inference offline"}</span><button type="submit" disabled={!draft.trim() || loading} aria-label="Send message"><Send size={17} /></button></div></div><div className="composer-note">NEXUS can make mistakes. Verify important information.</div></form>
+        <form className="composer-wrap" onSubmit={sendMessage}>
+          <div className="composer">
+            {fileMode && (
+              <input
+                className="file-path-input"
+                value={filePath}
+                onChange={(event) => setFilePath(event.target.value)}
+                placeholder="Relative file path, e.g. src/main.py"
+                aria-label="New project file path"
+              />
+            )}
+            <textarea
+              value={draft}
+              onChange={(event) => setDraft(event.target.value)}
+              placeholder={
+                fileMode ? "Describe the file NEXUS should draft..." : "Message NEXUS..."
+              }
+              rows={1}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && !event.shiftKey) {
+                  event.preventDefault();
+                  void sendMessage(event);
+                }
+              }}
+              aria-label={fileMode ? "Describe a project file" : "Message NEXUS"}
+            />
+            <div className="composer-tools">
+              <span>
+                <span className="composer-dot" />{" "}
+                {capabilities?.inference_available
+                  ? "Local inference ready"
+                  : "Inference offline"}
+              </span>
+              <button
+                type="button"
+                className={`file-mode-button ${fileMode ? "file-mode-active" : ""}`}
+                onClick={() => {
+                  setFileMode(!fileMode);
+                  setError("");
+                }}
+                aria-pressed={fileMode}
+              >
+                <FilePlus2 size={14} /> {fileMode ? "File mode" : "Create file"}
+              </button>
+              <button
+                type="submit"
+                disabled={!draft.trim() || loading || Boolean(fileProposal)}
+                aria-label="Send message"
+              >
+                <Send size={17} />
+              </button>
+            </div>
+          </div>
+          <div className="composer-note">
+            {fileProposal
+              ? "Review or cancel the pending file draft before sending another message."
+              : fileMode
+                ? "NEXUS drafts the file; review and approve it before it is saved."
+                : "NEXUS can make mistakes. Verify important information."}
+          </div>
+        </form>
         <footer className="statusbar"><span><span className={`status-dot ${capabilities?.inference_available ? "online" : ""}`} /> {capabilities?.inference_available ? "Connected to local model" : "Local model unavailable"}</span><span>PROJECT <b>{project}</b></span></footer>
       </section>
     </main>

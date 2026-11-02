@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Download the pinned public Qwen GGUF and verify its known SHA-256."""
+"""Download the pinned public Qwen Coder GGUF and verify its known SHA-256."""
 
 import hashlib
 import os
@@ -9,11 +9,11 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-REPOSITORY = "bartowski/Qwen2.5-0.5B-Instruct-GGUF"
-REVISION = "41ba88dbac95fed2528c92514c131d73eb5a174b"
-FILENAME = "Qwen2.5-0.5B-Instruct-Q4_K_M.gguf"
-EXPECTED_SHA256 = "6eb923e7d26e9cea28811e1a8e852009b21242fb157b26149d3b188f3a8c8653"
-EXPECTED_BYTES = 397_808_192
+REPOSITORY = "bartowski/Qwen2.5-Coder-3B-Instruct-GGUF"
+REVISION = "7c137640ef0332dfedb229f2504c58d83ed4307a"
+FILENAME = "Qwen2.5-Coder-3B-Instruct-Q4_K_M.gguf"
+EXPECTED_SHA256 = "3da3afe6cf5c674ac195803ea0dd6fee7e1c228c2105c1ce8c66890d1d4ab460"
+EXPECTED_BYTES = 1_929_903_360
 URL = f"https://huggingface.co/{REPOSITORY}/resolve/{REVISION}/{FILENAME}"
 
 
